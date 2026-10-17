@@ -8,11 +8,12 @@ for a set of queries. Outputs results as JSON.
 import argparse
 import json
 import os
+import re
 import select
 import subprocess
 import sys
+import tempfile
 import time
-import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -32,6 +33,124 @@ def find_project_root() -> Path:
     return current
 
 
+def _input_names_target(tool_name: str, tool_input: dict, target_name: str) -> bool:
+    """True when a Skill/Read tool input names target_name exactly."""
+    if tool_name == "Skill":
+        return tool_input.get("skill") == target_name
+    if tool_name == "Read":
+        parts = Path(tool_input.get("file_path", "")).parts
+        return "skills" in parts and target_name in parts
+    return False
+
+
+def _json_blob_names_target(tool_name: str, blob: str, target_name: str) -> bool:
+    """True when a tool-input JSON blob names target_name exactly.
+
+    Falls back to a strict key/value probe when the blob is still partial JSON.
+    """
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        if tool_name == "Skill":
+            return re.search(r'"skill"\s*:\s*"%s"' % re.escape(target_name), blob) is not None
+        return False
+    if not isinstance(data, dict):
+        return False
+    return _input_names_target(tool_name, data, target_name)
+
+
+def detect_skill_trigger(events, target_name: str) -> bool:
+    """Return True if any Skill/Read tool_use names target_name.
+
+    Unrelated tools are ignored — a Bash call before Skill does not abort
+    detection. Matching is against the real skill name, never a stand-in
+    identifier, and never a substring of a different name.
+    """
+    pending_tool = None
+    accumulated = ""
+
+    for event in events:
+        etype = event.get("type")
+
+        if etype == "stream_event":
+            se = event.get("event", {})
+            se_type = se.get("type", "")
+
+            if se_type == "content_block_start":
+                cb = se.get("content_block", {})
+                if cb.get("type") == "tool_use":
+                    tool_name = cb.get("name", "")
+                    pending_tool = tool_name if tool_name in ("Skill", "Read") else None
+                    accumulated = ""
+
+            elif se_type == "content_block_delta" and pending_tool:
+                delta = se.get("delta", {})
+                if delta.get("type") == "input_json_delta":
+                    accumulated += delta.get("partial_json", "")
+                    if _json_blob_names_target(pending_tool, accumulated, target_name):
+                        return True
+
+            elif se_type in ("content_block_stop", "message_stop"):
+                if pending_tool and _json_blob_names_target(pending_tool, accumulated, target_name):
+                    return True
+                pending_tool = None
+                accumulated = ""
+
+        elif etype == "assistant":
+            for item in event.get("message", {}).get("content", []):
+                if item.get("type") != "tool_use":
+                    continue
+                tool_name = item.get("name", "")
+                if tool_name not in ("Skill", "Read"):
+                    continue
+                if _input_names_target(tool_name, item.get("input", {}), target_name):
+                    return True
+
+        elif etype == "result":
+            return False
+
+    return False
+
+
+def _iter_process_events(process, timeout: int):
+    """Yield parsed JSON events from process stdout until timeout or EOF."""
+    start_time = time.time()
+    buffer = ""
+
+    while time.time() - start_time < timeout:
+        if process.poll() is not None:
+            remaining = process.stdout.read()
+            if remaining:
+                buffer += remaining.decode("utf-8", errors="replace")
+            break
+
+        ready, _, _ = select.select([process.stdout], [], [], 1.0)
+        if not ready:
+            continue
+
+        chunk = os.read(process.stdout.fileno(), 8192)
+        if not chunk:
+            break
+        buffer += chunk.decode("utf-8", errors="replace")
+
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            yield event
+
+    if buffer.strip():
+        try:
+            yield json.loads(buffer.strip())
+        except json.JSONDecodeError:
+            pass
+
+
 def run_single_query(
     query: str,
     skill_name: str,
@@ -42,30 +161,27 @@ def run_single_query(
 ) -> bool:
     """Run a single query and return whether the skill was triggered.
 
-    Creates a command file in .claude/commands/ so it appears in Claude's
-    available_skills list, then runs `claude -p` with the raw query.
-    Uses --include-partial-messages to detect triggering early from
-    stream events (content_block_start) rather than waiting for the
-    full assistant message, which only arrives after tool execution.
+    Stages the skill under test at .claude/skills/<skill_name>/SKILL.md in an
+    isolated directory (so parallel workers cannot clobber each other), runs
+    `claude -p` from there, and reports whether the model invoked that skill
+    by its real name via a Skill or Read tool call.
     """
-    unique_id = uuid.uuid4().hex[:8]
-    clean_name = f"{skill_name}-skill-{unique_id}"
-    project_commands_dir = Path(project_root) / ".claude" / "commands"
-    command_file = project_commands_dir / f"{clean_name}.md"
-
+    staging = tempfile.TemporaryDirectory(prefix="skill-probe-")
     try:
-        project_commands_dir.mkdir(parents=True, exist_ok=True)
+        staging_root = Path(staging.name)
+        skill_dir = staging_root / ".claude" / "skills" / skill_name
+        skill_dir.mkdir(parents=True)
         # Use YAML block scalar to avoid breaking on quotes in description
         indented_desc = "\n  ".join(skill_description.split("\n"))
-        command_content = (
+        (skill_dir / "SKILL.md").write_text(
             f"---\n"
+            f"name: {skill_name}\n"
             f"description: |\n"
             f"  {indented_desc}\n"
             f"---\n\n"
             f"# {skill_name}\n\n"
             f"This skill handles: {skill_description}\n"
         )
-        command_file.write_text(command_content)
 
         cmd = [
             "claude",
@@ -86,99 +202,21 @@ def run_single_query(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            cwd=project_root,
+            cwd=str(staging_root),
             env=env,
         )
 
-        triggered = False
-        start_time = time.time()
-        buffer = ""
-        # Track state for stream event detection
-        pending_tool_name = None
-        accumulated_json = ""
-
         try:
-            while time.time() - start_time < timeout:
-                if process.poll() is not None:
-                    remaining = process.stdout.read()
-                    if remaining:
-                        buffer += remaining.decode("utf-8", errors="replace")
-                    break
-
-                ready, _, _ = select.select([process.stdout], [], [], 1.0)
-                if not ready:
-                    continue
-
-                chunk = os.read(process.stdout.fileno(), 8192)
-                if not chunk:
-                    break
-                buffer += chunk.decode("utf-8", errors="replace")
-
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    # Early detection via stream events
-                    if event.get("type") == "stream_event":
-                        se = event.get("event", {})
-                        se_type = se.get("type", "")
-
-                        if se_type == "content_block_start":
-                            cb = se.get("content_block", {})
-                            if cb.get("type") == "tool_use":
-                                tool_name = cb.get("name", "")
-                                if tool_name in ("Skill", "Read"):
-                                    pending_tool_name = tool_name
-                                    accumulated_json = ""
-                                else:
-                                    return False
-
-                        elif se_type == "content_block_delta" and pending_tool_name:
-                            delta = se.get("delta", {})
-                            if delta.get("type") == "input_json_delta":
-                                accumulated_json += delta.get("partial_json", "")
-                                if clean_name in accumulated_json:
-                                    return True
-
-                        elif se_type in ("content_block_stop", "message_stop"):
-                            if pending_tool_name:
-                                return clean_name in accumulated_json
-                            if se_type == "message_stop":
-                                return False
-
-                    # Fallback: full assistant message
-                    elif event.get("type") == "assistant":
-                        message = event.get("message", {})
-                        for content_item in message.get("content", []):
-                            if content_item.get("type") != "tool_use":
-                                continue
-                            tool_name = content_item.get("name", "")
-                            tool_input = content_item.get("input", {})
-                            if tool_name == "Skill" and clean_name in tool_input.get("skill", ""):
-                                triggered = True
-                            elif tool_name == "Read" and clean_name in tool_input.get("file_path", ""):
-                                triggered = True
-                            return triggered
-
-                    elif event.get("type") == "result":
-                        return triggered
+            events = _iter_process_events(process, timeout)
+            return detect_skill_trigger(events, skill_name)
         finally:
-            # Clean up process on any exit path (return, exception, timeout)
             if process.poll() is None:
                 process.kill()
                 process.wait()
-
-        return triggered
+            if process.stdout:
+                process.stdout.close()
     finally:
-        if command_file.exists():
-            command_file.unlink()
+        staging.cleanup()
 
 
 def run_eval(
