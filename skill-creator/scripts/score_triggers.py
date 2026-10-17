@@ -76,28 +76,24 @@ def run_trigger_query(query: str, description: str, skill_name: str) -> bool:
     """
     Detect if a query triggers the skill via claude -p with stream-json.
     Returns True if the skill appears to be triggered.
+
+    Delegates to run_eval.run_single_query: stages a real skill at
+    .claude/skills/<skill_name>/SKILL.md in an isolated dir and matches the
+    real name in a Skill/Read tool call. (The old tempfile stand-in +
+    stdout grep was invisible to claude and scored essentially always False.)
     """
-    import tempfile
+    from scripts.run_eval import run_single_query
 
-    # Use tempfile to avoid polluting the working directory
-    with tempfile.TemporaryDirectory(prefix='skill-trigger-') as tmp_dir:
-        cmd_file = Path(tmp_dir) / f"{skill_name}-trigger.md"
-        cmd_file.write_text(f"---\ndescription: {description}\n---\n\n{query}\n")
-
-        try:
-            env = os.environ.copy()
-            env.pop('CLAUDECODE', None)  # Allow nested runs
-
-            result = subprocess.run(
-                ['claude', '-p', query, '--output-format', 'stream-json', '--verbose'],
-                capture_output=True, text=True, timeout=120, env=env
-            )
-
-            triggered = cmd_file.stem in result.stdout
-            return triggered
-
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            return False
+    try:
+        return run_single_query(
+            query=query,
+            skill_name=skill_name,
+            skill_description=description,
+            timeout=120,
+            project_root=".",
+        )
+    except FileNotFoundError:
+        return False
 
 
 def score(cases: list, skill_name: str, description: str, runs: int, threshold: float, live: bool) -> dict:
